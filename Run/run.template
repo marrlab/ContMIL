@@ -1,0 +1,25 @@
+#!/bin/bash
+
+#SBATCH -o ./logs/out-@exp@-@mth@.txt
+#SBATCH -e ./logs/out-@exp@-@mth@.txt
+
+##SBATCH -J clwbc@exp@@mth@
+#SBATCH -J @exp@@mth@
+#SBATCH -p gpu_p
+
+#SBATCH --gres=gpu:1
+#SBATCH -c 6
+
+#SBATCH --mem=90G
+
+#SBATCH --nice=10000
+
+#SBATCH --qos=gpu
+
+#SBATCH -t 2-00:00:00
+
+cd ..
+
+python3 main.py @mth@ @exp@
+
+
