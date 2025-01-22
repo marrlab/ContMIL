@@ -66,7 +66,7 @@ class ContinualLearner:
             else:
                 self.n_known = len(self.task.class_list)
 
-            self.model = self.model.to(self.device)
+        self.model = self.model.to(self.device)
 
     def train_task(self, data):
         print("training task")
@@ -140,8 +140,11 @@ class ContinualLearner:
         train_loader = torch.utils.data.DataLoader(dl, num_workers=1)
         test_loader = torch.utils.data.DataLoader(dlt, num_workers=1)
         if self.task.task_id > 0:
-            dl = self.combine_dataset_with_exemplars(dl)
+            self.combine_dataset_with_exemplars(dl)
+            dl = Dataloader(self.task, data, train=True)
+            dlt = Dataloader(self.task, data, train=False)
             train_loader = torch.utils.data.DataLoader(dl, num_workers=1)
+            test_loader = torch.utils.data.DataLoader(dlt, num_workers=1)
             self.model.update_aux_classifier(len(self.task.class_list) + 1)
 
         # Step 3: Representation Learning Stage
@@ -952,14 +955,14 @@ class ContinualLearner:
         for param in self.model.parameters():
             param.requires_grad = True
 
-    def combine_dataset_with_exemplars(self, dl):
+    def combine_dataset_with_exemplars(self, dataset):
         for eskey in self.exemplar_sets:
             if self.task.experiment == 2:
                 eslbl = eskey.split("-")[1]
             else:
                 eslbl = eskey
-            dl.append(self.exemplar_sets[eskey], eslbl)
-        return dl
+            dataset.append(self.exemplar_sets[eskey], eslbl)
+        return dataset
 
     def create_balanced_val_set(self, dl):
         """

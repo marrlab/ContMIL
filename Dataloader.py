@@ -1,5 +1,6 @@
 import random
 import string
+import torch
 
 
 class Dataloader:
@@ -19,9 +20,11 @@ class Dataloader:
         return index, feats, label
 
     def _get(self, pid):
+
         feats = self.data[pid]
         label = self.patients[pid]["label"]
-
+        # feats = torch.tensor(feats, dtype=torch.float)
+        # label = torch.tensor(label, dtype=torch.long)
         return feats, label
 
     def get_images(self, cls):
@@ -36,5 +39,6 @@ class Dataloader:
         for i, img in enumerate(imgs):
             pid = "icarl-" + key + "-" + str(i) + "-" + ''.join(
                 random.choice(string.ascii_lowercase) for i in range(7))
-            self.data[pid] = imgs
+            #  self.data[pid] = imgs
+            self.data[pid] = img
             self.patients[pid] = {"label": int(key)}
