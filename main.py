@@ -12,7 +12,9 @@ if __name__ == '__main__':
     tm = TaskManager(experiment=experiment)
     data = loaddata(True)
 
-    for task in tm:
+    for i, task in enumerate(tm):
+        if i == 0:
+            continue
         print(task)
         cl = ContinualLearner(task, method)
         # cl = ContinualLearner(tm[1], method)

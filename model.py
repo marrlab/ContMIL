@@ -103,8 +103,6 @@ class AMiLExpandable(AMiL):
 
         # Store additional feature extractors in a list
         self.additional_feature_extractors = nn.ModuleList()
-        self.feature_extractor_masks = nn.ParameterList()
-        self.aux_classifier = None
 
         # Auxiliary classifier for DER
         self.aux_classifier = nn.Sequential(
@@ -126,6 +124,7 @@ class AMiLExpandable(AMiL):
         in_ch = input_channels
         for hidden_ch in hidden_layers:
             layers.append(nn.Conv2d(in_ch, hidden_ch, kernel_size=2))
+            layers.append(MaskLayer(hidden_ch))  # Add channel-level mask layer
             layers.append(nn.ReLU())
             in_ch = hidden_ch
 
@@ -137,20 +136,31 @@ class AMiLExpandable(AMiL):
         # Add the feature extractor to the list
         self.additional_feature_extractors.append(nn.Sequential(*layers))
 
-        # Add a separate learnable mask for the feature extractor
-        mask = nn.Parameter(torch.ones(output_channels), requires_grad=True)
-        self.feature_extractor_masks.append(mask)
-        # Update attention mechanism to handle the new combined feature size
-        self.update_attention()
-        self.update_classifier()
-
     def update_attention(self):
         """
         Update the attention mechanism dynamically based on the current combined feature size.
         """
         # Calculate the new size of combined features
+
         combined_feature_size = self.L * \
             (len(self.additional_feature_extractors) + 1)
+
+        # Redefine the attention mechanism
+        self.attention = nn.Sequential(
+            # Adjust input size dynamically
+            nn.Linear(combined_feature_size, self.D),
+            nn.Tanh(),
+            nn.Linear(self.D, 1)
+        )
+
+    def update_attention_aux(self):
+        """
+        Update the attention mechanism dynamically based on the current combined feature size.
+        """
+        # Calculate the new size of combined features
+
+        combined_feature_size = self.L * \
+            (len(self.additional_feature_extractors))
 
         # Redefine the attention mechanism
         self.attention = nn.Sequential(
@@ -176,18 +186,31 @@ class AMiLExpandable(AMiL):
             nn.Linear(256, num_classes)
         )
 
-    def forward(self, x):
+    def update_aux_classifier(self, num_classes):
+        """
+        Update the auxiliary classifier for the current task.
+        Args:
+            num_classes (int): Number of classes in the current task + 1 for "other".
+        """
+        combined_feature_size = self.L * \
+            (len(self.additional_feature_extractors))
+
+        self.aux_classifier = nn.Sequential(
+            nn.Linear(combined_feature_size, 256),
+            nn.ReLU(),
+            nn.Linear(256, num_classes)  # Dynamically set the output size
+        )
+
+    def forward_main(self, x):
         base_features = self.ftr_proc(x)
 
         # Collect features from additional extractors with masks
         additional_features = []
-        for extractor, mask in zip(self.additional_feature_extractors, self.feature_extractor_masks):
+        for extractor in self.additional_feature_extractors:
             current_feature_ext = extractor(x)
-            masked_features = current_feature_ext * \
-                torch.sigmoid(mask)  # Apply mask
-            additional_features.append(masked_features)
+            additional_features.append(current_feature_ext)
 
-        # Concatenate all features
+        # Concatenate all features, no chaining !
         combined_features = torch.cat(
             [base_features] + additional_features, dim=1)
 
@@ -207,20 +230,41 @@ class AMiLExpandable(AMiL):
             # Shape: [1, feature_dim]
             newest_features = torch.mm(att_softmax, newest_features)
 
-        return prediction, newest_features
+        return prediction
+
+    def forward_aux(self, x):
+        # Collect features from additional extractors with masks
+        current_feature_ext = self.additional_feature_extractors[-1]
+        current_features = current_feature_ext(x)
+
+        # Apply dynamic attention mechanism
+        att_raw = self.attention(current_features)
+        att_raw = torch.transpose(att_raw, 1, 0)
+        att_softmax = F.softmax(att_raw, dim=1)
+        bag_features = torch.mm(att_softmax, current_features)
+
+        # Classifier prediction
+        prediction = self.aux_classifier(bag_features)
+        return prediction
+
+    def forward(self, x, mode="main"):
+        if mode == "main":
+            return self.forward_main(x)
+        elif mode == "aux":
+            return self.forward_aux(x)
+        else:
+            raise ValueError("Invalid mode. Use 'main' or 'aux'.")
 
     # can be deleted
-    def get_features(self, x):
+    def get_features_main(self, x):
         """Get features from all extractors."""
         base_features = self.ftr_proc(x)
 
         # Collect features from additional extractors with masks
         additional_features = []
-        for extractor, mask in zip(self.additional_feature_extractors, self.feature_extractor_masks):
+        for extractor in self.additional_feature_extractors:
             current_feature_ext = extractor(x)
-            masked_features = current_feature_ext * \
-                torch.sigmoid(mask)  # Apply mask
-            additional_features.append(masked_features)
+            additional_features.append(current_feature_ext)
 
         # Concatenate all features
         combined_features = torch.cat(
@@ -233,14 +277,49 @@ class AMiLExpandable(AMiL):
         bag_features = torch.mm(att_softmax, combined_features)
         return bag_features
 
-    def update_aux_classifier(self, num_classes):
+    def get_features_aux(self, x):
+        self.update_attention_aux()
+        # Collect features from additional extractors with masks
+        current_feature_ext = self.additional_feature_extractors[-1]
+        current_features = current_feature_ext(x)
+
+        # Apply dynamic attention mechanism
+        att_raw = self.attention(current_features)
+        att_raw = torch.transpose(att_raw, 1, 0)
+        att_softmax = F.softmax(att_raw, dim=1)
+        bag_features = torch.mm(att_softmax, current_features)
+        return bag_features
+
+
+class MaskLayer(nn.Module):
+
+    def __init__(self, num_channels):
         """
-        Update the auxiliary classifier for the current task.
+        A custom mask layer for applying a learnable mask to each channel.
         Args:
-            num_classes (int): Number of classes in the current task + 1 for "other".
+            num_channels (int): Number of channels to mask.
         """
-        self.aux_classifier = nn.Sequential(
-            nn.Linear(self.L, 256),
-            nn.ReLU(),
-            nn.Linear(256, num_classes)  # Dynamically set the output size
-        )
+        super(MaskLayer, self).__init__()
+        # Learnable mask parameter for each channel
+        self.mask = nn.Parameter(torch.ones(
+            num_channels), requires_grad=True)
+
+    def binarize(self):
+        """
+        Binarize the mask parameters to create a binary mask.
+        """
+        with torch.no_grad():
+            self.mask.data = (
+                self.mask.data > 0.5).float()
+
+    def forward(self, x):
+        """
+        Apply the mask to the input tensor.
+        Args:
+            x (torch.Tensor): Input tensor of shape [batch_size, num_channels, height, width].
+        Returns:
+            torch.Tensor: Masked output.
+        """
+        # Apply the mask channel-wise (reshape mask to [1, num_channels, 1, 1])
+        self.binarize()
+        return x * self.mask.view(1, -1, 1, 1)

@@ -129,27 +129,27 @@ class ContinualLearner:
     def _train_der(self, data):
         print("Training task")
         self._init_der()
-
-        # Step 1: Add a new feature extractor if this is not the first task
-        if self.task.task_id > 0:
-            self.add_new_feature_extractor(
-                input_channels=512, output_channels=400, hidden_layers=[300, 200, 100])
-
         dl = Dataloader(self.task, data, train=True)
         dlt = Dataloader(self.task, data, train=False)
         train_loader = torch.utils.data.DataLoader(dl, num_workers=1)
         test_loader = torch.utils.data.DataLoader(dlt, num_workers=1)
+        # Step 1: Add a new feature extractor if this is not the first task
         if self.task.task_id > 0:
+            self.add_new_feature_extractor(
+                input_channels=512, output_channels=400, hidden_layers=[300, 200, 100])
             self.combine_dataset_with_exemplars(dl)
             dl = Dataloader(self.task, data, train=True)
             dlt = Dataloader(self.task, data, train=False)
             train_loader = torch.utils.data.DataLoader(dl, num_workers=1)
             test_loader = torch.utils.data.DataLoader(dlt, num_workers=1)
             self.model.update_aux_classifier(len(self.task.class_list) + 1)
-
+            # Update attention mechanism to handle the new combined feature size
+            self.model.update_attention()
+            self.model.update_classifier()
         # Step 3: Representation Learning Stage
         optimizer = optim.SGD(self.model.parameters(),
                               lr=0.0005, momentum=0.9, nesterov=True)
+
         for ep in range(self.epochs):
             self.model.train()
             total_loss, corrects = 0, 0
@@ -158,18 +158,27 @@ class ContinualLearner:
                 optimizer.zero_grad()
                 label, bag = label.to(self.device), bag.to(
                     self.device).squeeze()
+                if self.task.task_id > 0:
+                    # Step 1: Prune and mask the new feature extractor
+                    sparsity_loss, pruned_features = self._apply_mask(
+                        batch_idx, len(train_loader), bag)
 
-                # Forward pass
-                prediction, current_task_features = self.model(bag)
+                    # Step 2: Compute auxiliary loss using pruned features
+                    aux_loss = self._compute_aux_loss(pruned_features, label)
+                    self.model.update_attention()
+                    self.model.update_classifier()
+                else:
+                    sparsity_loss = 0
+                    aux_loss = 0
 
-                # Compute losses
-                clsloss = nn.CrossEntropyLoss()(prediction, label)  # Classification loss (L_H^t)
-                aux_loss = self._compute_aux_loss(
-                    current_task_features, label) if current_task_features is not None else 0  # Auxiliary loss (L_Ha^t)
-                sparsity_loss = self._compute_sparsity_loss()  # Sparsity loss (L_S)
+                # Step 3: Forward pass through the main model for classification
+                prediction = self.model(bag, mode='main')
 
-                # Combine losses
-                loss = clsloss + 0.1 * aux_loss + 0.1 * sparsity_loss
+                # Step 4: Compute classification loss
+                clsloss = nn.CrossEntropyLoss()(prediction, label)
+
+                # Step 5: Combine losses
+                loss = clsloss + 0.1 * sparsity_loss + 0.1 * aux_loss
                 total_loss += loss.item()
 
                 # Backpropagation
@@ -183,21 +192,18 @@ class ContinualLearner:
             accuracy = corrects / len(train_loader)
             print(
                 f"Epoch {ep + 1}/{self.epochs}, Loss: {total_loss:.3f}, Accuracy: {accuracy:.3f}")
-
-        # Step 4: Prune and binarize the current feature extractor
-        self.binarize_masks()
-        # balance data
-        bdl, _ = self.create_balanced_data_loader(dl)
-        # Step 4: Classifier Learning Stage (Retrain Classifier with Balanced Data)
-        self.retrain_classifier(bdl)
+        if self.task.task_id > 0:
+            # balance data
+            bdl, _ = self.create_balanced_data_loader(dl)
+            # Step 4: Classifier Learning Stage (Retrain Classifier with Balanced Data)
+            self.retrain_classifier(bdl)
         self.update_memory(dl)
         # Step 6: Evaluate and finalize the model
         self._evaluate_model(test_loader)
 
     def _compute_aux_loss(self, current_task_features, labels):
         # Auxiliary classifier for the new feature extractor (F_t(x))
-        aux_predictions = F.softmax(
-            self.model.aux_classifier(current_task_features), dim=1)
+        aux_predictions = self.model.aux_classifier(current_task_features)
 
         # Create auxiliary labels: new classes + 1 "other" category for old classes
         aux_labels = torch.where(labels >= len(
@@ -207,15 +213,49 @@ class ContinualLearner:
         aux_loss = nn.CrossEntropyLoss()(aux_predictions, aux_labels)
         return aux_loss
 
-    def _compute_sparsity_loss(self):
+    def _compensate_mask_gradients(self, batch_idx, num_batches):
+        """Compensates gradients for mask parameters in the current feature extractor."""
+        # Annealing schedule for `s`
+        s = 1 / self.s_max + (self.s_max - 1 / self.s_max) * \
+            (batch_idx / (num_batches - 1))
+        # Focus only on the newest feature extractor
+        if len(self.model.additional_feature_extractors) > 0:
+            current_extractor = self.model.additional_feature_extractors[-1]
+
+            for name, param in current_extractor.named_parameters():
+                if "mask" in name:
+                    # Compute sigmoid-scaled mask
+                    sigmoid_scaled_mask = torch.sigmoid(s * param)
+                    # Gradient compensation
+                    compensation_factor = (sigmoid_scaled_mask * (1 - sigmoid_scaled_mask)) / (
+                        s * torch.sigmoid(param) *
+                        (1 - torch.sigmoid(param)) + 1e-10
+                    )
+                    param.grad *= compensation_factor
+
+    def _apply_mask(self, batch_idx, num_batches, bag):
+        """
+        Apply mask to the new feature extractor, prune it, and compute sparsity loss.
+        """
+        # Annealing schedule for `s`
+        s = 1 / self.s_max + (self.s_max - 1 / self.s_max) * \
+            (batch_idx / (num_batches - 1))
         sparsity_loss = 0
-        # Focus only on the current task's feature extractor (last one added)
+        masked_features = None
+
+        # Focus only on the newest feature extractor
         if len(self.model.additional_feature_extractors) > 0:
             current_extractor = self.model.additional_feature_extractors[-1]
             for name, param in current_extractor.named_parameters():
                 if "mask" in name:
-                    sparsity_loss += torch.sum(torch.abs(param))
-        return sparsity_loss
+                    # Compute sigmoid-scaled mask
+                    sigmoid_scaled_mask = torch.sigmoid(s * param)
+                    sparsity_loss += torch.sum(torch.abs(sigmoid_scaled_mask))
+            # Apply the pruned mask to the features
+            masked_features = self.model.get_features_aux(bag)
+        # Normalize sparsity loss
+        sparsity_loss /= len(self.model.additional_feature_extractors)
+        return sparsity_loss, masked_features
 
     def update_memory(self, dl):
         m = self.K // (len(self.exemplar_sets.keys()) +
@@ -281,16 +321,6 @@ class ContinualLearner:
         btrain_loader = torch.utils.data.DataLoader(bdl, num_workers=1)
         return btrain_loader, balanced_data
 
-    def _compensate_mask_gradients(self, batch_idx, num_batches):
-        """Compensates gradients for mask parameters in the current feature extractor."""
-        s = self.s_max * (batch_idx / (num_batches - 1))
-        if len(self.model.additional_feature_extractors) > 0:
-            current_extractor = self.model.additional_feature_extractors[-1]
-            for name, param in current_extractor.named_parameters():
-                if "mask" in name:
-                    grad = param.grad
-                    param.grad = grad * (s / (1 + s))
-
     def add_new_feature_extractor(self, input_channels, output_channels, hidden_layers):
         print("Adding new feature extractor...")
         self.model.add_feature_extractor(
@@ -322,7 +352,7 @@ class ContinualLearner:
 
                 # Forward pass through the frozen feature extractor
                 with torch.no_grad():
-                    features = self.model.get_features(bag)
+                    features = self.model.get_features_main(bag)
 
                 # Apply the classifier
                 logits = self.model.classifier(features)
@@ -356,7 +386,7 @@ class ContinualLearner:
             for _, bag, label in test_loader:
                 label, bag = label.to(self.device), bag.to(
                     self.device).squeeze()
-                prediction, _ = self.model(bag)
+                prediction = self.model(bag, mode='main')
                 if torch.argmax(prediction, dim=1).item() == label.item():
                     corrects += 1
 
@@ -749,7 +779,8 @@ class ContinualLearner:
         features = []
         for i, patient in enumerate(images):
             x = Variable(torch.tensor(patient).float()).to(self.device)
-            feature = self.model.get_features(x.squeeze()).data.cpu().numpy()
+            feature = self.model.get_features_main(
+                x.squeeze()).data.cpu().numpy()
             feature = feature / np.linalg.norm(feature)  # Normalize
             features.append(feature[0])
         # calculate class mean
@@ -1288,7 +1319,8 @@ class ContinualLearner:
         features = []
         for i, patient in enumerate(images):
             x = Variable(torch.tensor(patient).float()).to(self.device)
-            feature = self.model.get_features(x.squeeze()).data.cpu().numpy()
+            feature = self.model.get_features_main(
+                x.squeeze()).data.cpu().numpy()
             feature = feature / np.linalg.norm(feature)  # Normalize
             features.append(feature[0])
 
@@ -1683,7 +1715,7 @@ class ContinualLearner:
                     prediction = self.classify(bag)
                     preds = torch.cat([preds, prediction])
             elif self.method == 'der':
-                prediction, _ = self.model(bag)
+                prediction = self.model(bag, mode='main')
                 preds = torch.cat([preds, torch.argmax(prediction, dim=1)])
             else:
                 prediction = self.model(bag)
