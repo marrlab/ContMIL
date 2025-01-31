@@ -159,9 +159,7 @@ class AMiLExpandable(AMiL):
         """
         # Calculate the new size of combined features
 
-        combined_feature_size = self.L * \
-            (len(self.additional_feature_extractors))
-
+        combined_feature_size = self.L
         # Redefine the attention mechanism
         self.attention = nn.Sequential(
             # Adjust input size dynamically
@@ -186,14 +184,13 @@ class AMiLExpandable(AMiL):
             nn.Linear(256, num_classes)
         )
 
-    def update_aux_classifier(self, num_classes):
+    def update_classifier_aux(self, num_classes):
         """
         Update the auxiliary classifier for the current task.
         Args:
             num_classes (int): Number of classes in the current task + 1 for "other".
         """
-        combined_feature_size = self.L * \
-            (len(self.additional_feature_extractors))
+        combined_feature_size = self.L
 
         self.aux_classifier = nn.Sequential(
             nn.Linear(combined_feature_size, 256),

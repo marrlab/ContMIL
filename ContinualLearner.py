@@ -142,10 +142,11 @@ class ContinualLearner:
             dlt = Dataloader(self.task, data, train=False)
             train_loader = torch.utils.data.DataLoader(dl, num_workers=1)
             test_loader = torch.utils.data.DataLoader(dlt, num_workers=1)
-            self.model.update_aux_classifier(len(self.task.class_list) + 1)
+
+            self.model.update_classifier_aux(len(self.task.class_list) + 1)
             # Update attention mechanism to handle the new combined feature size
-            self.model.update_attention()
-            self.model.update_classifier()
+            self.model.update_attention_aux()
+
         # Step 3: Representation Learning Stage
         optimizer = optim.SGD(self.model.parameters(),
                               lr=0.0005, momentum=0.9, nesterov=True)
