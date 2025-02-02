@@ -132,18 +132,35 @@ class AMiLExpandable(AMiL):
         # Adjust based on final spatial dims
         conv_output_size = hidden_layers[-1] * 2 * 2
         layers.append(nn.Linear(conv_output_size, output_channels))
+        # Create new feature extractor
+        new_extractor = nn.Sequential(*layers)
+
+        # **Initialize with previous extractor's weights (if available)**
+        if self.additional_feature_extractors:
+            # Get last extractor
+            prev_extractor = self.additional_feature_extractors[-1]
+            with torch.no_grad():
+                for new_layer, prev_layer in zip(new_extractor, prev_extractor):
+                    # Copy weights if the layer types match
+                    if isinstance(new_layer, nn.Conv2d) and isinstance(prev_layer, nn.Conv2d):
+                        new_layer.weight.data.copy_(prev_layer.weight.data)
+                        new_layer.bias.data.copy_(prev_layer.bias.data)
+                    elif isinstance(new_layer, nn.Linear) and isinstance(prev_layer, nn.Linear):
+                        new_layer.weight.data.copy_(prev_layer.weight.data)
+                        new_layer.bias.data.copy_(prev_layer.bias.data)
 
         # Add the feature extractor to the list
-        self.additional_feature_extractors.append(nn.Sequential(*layers))
+        self.additional_feature_extractors.append(new_extractor)
 
-    def update_attention(self):
+    def update_attention(self, mode):
         """
         Update the attention mechanism dynamically based on the current combined feature size.
         """
         # Calculate the new size of combined features
 
         combined_feature_size = self.L * \
-            (len(self.additional_feature_extractors) + 1)
+            (len(self.additional_feature_extractors) +
+             1) if mode == 'main' else self.L
 
         # Redefine the attention mechanism
         self.attention = nn.Sequential(
@@ -153,58 +170,61 @@ class AMiLExpandable(AMiL):
             nn.Linear(self.D, 1)
         )
 
-    def update_attention_aux(self):
-        """
-        Update the attention mechanism dynamically based on the current combined feature size.
-        """
-        # Calculate the new size of combined features
-
-        combined_feature_size = self.L
-        # Redefine the attention mechanism
-        self.attention = nn.Sequential(
-            # Adjust input size dynamically
-            nn.Linear(combined_feature_size, self.D),
-            nn.Tanh(),
-            nn.Linear(self.D, 1)
-        )
-
-    def update_classifier(self):
+    def update_classifier(self, mode, num_classes=None, reset=False):
         """
         Update the classifier dynamically based on the current combined feature size.
+        - If `reset=True`, the classifier is fully reinitialized (used for retraining).
+        - Otherwise, it inherits old feature weights for continual learning.
+
+        Args:
+            mode (str): Determines feature size ('main' or 'aux').
+            num_classes (int, optional): Number of output classes.
+            reset (bool): If True, fully reinitializes the classifier (for retraining).
         """
         combined_feature_size = self.L * \
-            (len(self.additional_feature_extractors) + 1)
-        # Keep the number of output classes
-        num_classes = self.classifier[-1].out_features
+            (len(self.additional_feature_extractors) +
+             1) if mode == 'main' else self.L
 
-        # Redefine the classifier with the updated input size
-        self.classifier = nn.Sequential(
+        if not num_classes:
+            # Keep number of output classes
+            num_classes = self.classifier[-1].out_features
+
+        # Create a new classifier
+        new_classifier = nn.Sequential(
             nn.Linear(combined_feature_size, 256),
             nn.ReLU(),
             nn.Linear(256, num_classes)
         )
 
-    def update_classifier_aux(self, num_classes):
-        """
-        Update the auxiliary classifier for the current task.
-        Args:
-            num_classes (int): Number of classes in the current task + 1 for "other".
-        """
-        combined_feature_size = self.L
+        # Only inherit weights if reset=False (continual learning)
+        if not reset:
+            with torch.no_grad():
+                old_classifier = self.classifier
+                # Previous feature size
+                old_input_size = old_classifier[0].in_features
 
-        self.aux_classifier = nn.Sequential(
-            nn.Linear(combined_feature_size, 256),
-            nn.ReLU(),
-            nn.Linear(256, num_classes)  # Dynamically set the output size
-        )
+                # Transfer weights for overlapping dimensions
+                new_classifier[0].weight[:,
+                                         :old_input_size] = old_classifier[0].weight
+                new_classifier[0].bias = old_classifier[0].bias
+
+                new_classifier[2].weight = old_classifier[2].weight
+                new_classifier[2].bias = old_classifier[2].bias
+
+        # Assign the new classifier
+        self.classifier = new_classifier
 
     def forward_main(self, x):
         base_features = self.ftr_proc(x)
 
         # Collect features from additional extractors with masks
         additional_features = []
-        for extractor in self.additional_feature_extractors:
+        for i, extractor in enumerate(self.additional_feature_extractors):
             current_feature_ext = extractor(x)
+
+            # Ensure previous extractors do not update their weights
+            if i < len(self.additional_feature_extractors) - 1:
+                current_feature_ext = current_feature_ext.detach()
             additional_features.append(current_feature_ext)
 
         # Concatenate all features, no chaining !
@@ -253,38 +273,32 @@ class AMiLExpandable(AMiL):
             raise ValueError("Invalid mode. Use 'main' or 'aux'.")
 
     # can be deleted
-    def get_features_main(self, x):
+    def get_features(self, x, mode):
         """Get features from all extractors."""
-        base_features = self.ftr_proc(x)
 
-        # Collect features from additional extractors with masks
-        additional_features = []
-        for extractor in self.additional_feature_extractors:
-            current_feature_ext = extractor(x)
-            additional_features.append(current_feature_ext)
+        if mode == 'aux':
+            self.update_attention(mode='aux')
+            # Collect features from additional extractors with masks
+            current_feature_ext = self.additional_feature_extractors[-1]
+            combined_features = current_feature_ext(x)
 
-        # Concatenate all features
-        combined_features = torch.cat(
-            [base_features] + additional_features, dim=1)
+        elif mode == 'main':
+            base_features = self.ftr_proc(x)
+            # Collect features from additional extractors with masks
+            additional_features = []
+            for extractor in self.additional_feature_extractors:
+                current_feature_ext = extractor(x)
+                additional_features.append(current_feature_ext)
+
+            # Concatenate all features
+            combined_features = torch.cat(
+                [base_features] + additional_features, dim=1)
 
         # Apply dynamic attention mechanism
         att_raw = self.attention(combined_features)
         att_raw = torch.transpose(att_raw, 1, 0)
         att_softmax = F.softmax(att_raw, dim=1)
         bag_features = torch.mm(att_softmax, combined_features)
-        return bag_features
-
-    def get_features_aux(self, x):
-        self.update_attention_aux()
-        # Collect features from additional extractors with masks
-        current_feature_ext = self.additional_feature_extractors[-1]
-        current_features = current_feature_ext(x)
-
-        # Apply dynamic attention mechanism
-        att_raw = self.attention(current_features)
-        att_raw = torch.transpose(att_raw, 1, 0)
-        att_softmax = F.softmax(att_raw, dim=1)
-        bag_features = torch.mm(att_softmax, current_features)
         return bag_features
 
 

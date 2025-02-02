@@ -23,15 +23,12 @@ class ContinualLearner:
         print(task)
         self.task = task
         self.method = method.lower()
-
         self.epochs = 1
-
         self.device = torch.device(
             "cuda:0" if torch.cuda.is_available() else "cpu")
         self.ngpu = torch.cuda.device_count()
         print("Found device: ", self.ngpu, "x ", self.device)
         self._init_model()
-        # self.wa_weights = wa_weights
         print("Setup complete.")
 
     def _init_model(self):
@@ -142,14 +139,21 @@ class ContinualLearner:
             dlt = Dataloader(self.task, data, train=False)
             train_loader = torch.utils.data.DataLoader(dl, num_workers=1)
             test_loader = torch.utils.data.DataLoader(dlt, num_workers=1)
-
-            self.model.update_classifier_aux(len(self.task.class_list) + 1)
-            # Update attention mechanism to handle the new combined feature size
-            self.model.update_attention_aux()
+            self.model.update_classifier(
+                mode='aux', num_classes=(len(self.task.class_list) + 1), reset=False)
 
         # Step 3: Representation Learning Stage
-        optimizer = optim.SGD(self.model.parameters(),
-                              lr=0.0005, momentum=0.9, nesterov=True)
+        # Freeze previous feature extractors (Φ_{t-1})
+        params_to_update = []
+        for name, param in self.model.named_parameters():
+            # Exclude parameters of previous feature extractors from updates
+            if any(name.startswith(f"additional_feature_extractors.{i}") for i in range(len(self.model.additional_feature_extractors) - 1)):
+                param.requires_grad = False  # Freeze previous extractors
+            else:
+                params_to_update.append(param)
+
+        optimizer = optim.SGD(params_to_update, lr=0.0005,
+                              momentum=0.9, nesterov=True)
 
         for ep in range(self.epochs):
             self.model.train()
@@ -161,13 +165,13 @@ class ContinualLearner:
                     self.device).squeeze()
                 if self.task.task_id > 0:
                     # Step 1: Prune and mask the new feature extractor
-                    sparsity_loss, pruned_features = self._apply_mask(
+                    sparsity_loss, new_features_only = self._apply_mask(
                         batch_idx, len(train_loader), bag)
 
                     # Step 2: Compute auxiliary loss using pruned features
-                    aux_loss = self._compute_aux_loss(pruned_features, label)
-                    self.model.update_attention()
-                    self.model.update_classifier()
+                    aux_loss = self._compute_aux_loss(new_features_only, label)
+                    self.model.update_attention(mode='main')
+                    self.model.update_classifier(mode='main', reset=False)
                 else:
                     sparsity_loss = 0
                     aux_loss = 0
@@ -253,7 +257,7 @@ class ContinualLearner:
                     sigmoid_scaled_mask = torch.sigmoid(s * param)
                     sparsity_loss += torch.sum(torch.abs(sigmoid_scaled_mask))
             # Apply the pruned mask to the features
-            masked_features = self.model.get_features_aux(bag)
+            masked_features = self.model.get_features(bag, mode='aux')
         # Normalize sparsity loss
         sparsity_loss /= len(self.model.additional_feature_extractors)
         return sparsity_loss, masked_features
@@ -327,19 +331,32 @@ class ContinualLearner:
         self.model.add_feature_extractor(
             input_channels, output_channels, hidden_layers)
 
-    def retrain_classifier(self, balanced_loader):
+    def retrain_classifier(self, balanced_loader, temperature=2.0):
         """
-        Retrain the classifier head with a class-balanced dataset.
-        """
-        print("Retraining the classifier...")
+        Retrain the classifier head with a class-balanced dataset to reduce bias.
 
-        # # Step 1: Reinitialize the classifier head
-        # self.model.update_classifier()
-        # Step 2: Prepare optimizer
+        Steps:
+        1. Re-initialize the classifier head with random weights.
+        2. Train only the classifier on a class-balanced dataset.
+        3. Use a Softmax temperature δ to improve class margins.
+
+        Args:
+            balanced_loader: DataLoader containing the class-balanced subset.
+            temperature (float): Temperature parameter for Softmax smoothing.
+        """
+        print("Re-initializing and retraining the classifier...")
+
+        # **Step 1: Fully reinitialize the classifier**
+        # Force full reinitialization
+        num_cls = len(self.task.cumm_cls)
+        self.model.update_classifier(
+            mode='main', num_classes=num_cls, reset=True)
+        print(self.model.classifier)
+        # **Step 2: Prepare optimizer (train only the classifier)**
         optimizer = optim.SGD(
             self.model.classifier.parameters(), lr=0.001, momentum=0.9)
 
-        # Step 3: Retrain the classifier
+        # **Step 3: Retrain the classifier**
         self.model.eval()  # Freeze feature extractors
         self.model.classifier.train()  # Train only the classifier
 
@@ -351,12 +368,12 @@ class ContinualLearner:
                 label, bag = label.to(self.device), bag.to(
                     self.device).squeeze()
 
-                # Forward pass through the frozen feature extractor
+                # Forward pass through frozen feature extractor
                 with torch.no_grad():
-                    features = self.model.get_features_main(bag)
+                    features = self.model.get_features(bag, mode='main')
 
-                # Apply the classifier
-                logits = self.model.classifier(features)
+                # **Apply classifier with Softmax temperature**
+                logits = self.model.classifier(features) / temperature
                 clsloss = nn.CrossEntropyLoss()(logits, label)
                 total_loss += clsloss.item()
 
@@ -780,8 +797,8 @@ class ContinualLearner:
         features = []
         for i, patient in enumerate(images):
             x = Variable(torch.tensor(patient).float()).to(self.device)
-            feature = self.model.get_features_main(
-                x.squeeze()).data.cpu().numpy()
+            feature = self.model.get_features(
+                x.squeeze(), mode='main').data.cpu().numpy()
             feature = feature / np.linalg.norm(feature)  # Normalize
             features.append(feature[0])
         # calculate class mean
@@ -1320,8 +1337,8 @@ class ContinualLearner:
         features = []
         for i, patient in enumerate(images):
             x = Variable(torch.tensor(patient).float()).to(self.device)
-            feature = self.model.get_features_main(
-                x.squeeze()).data.cpu().numpy()
+            feature = self.model.get_features(
+                x.squeeze(), mode='main').data.cpu().numpy()
             feature = feature / np.linalg.norm(feature)  # Normalize
             features.append(feature[0])
 

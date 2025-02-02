@@ -12,9 +12,16 @@ if __name__ == '__main__':
     tm = TaskManager(experiment=experiment)
     data = loaddata(True)
 
-    for i, task in enumerate(tm):
-        if i == 0:
-            continue
+    # for i, task in enumerate(tm):
+    #     if i == 0:
+    #         continue
+    #     print(task)
+    #     cl = ContinualLearner(task, method)
+    #     # cl = ContinualLearner(tm[1], method)
+    #     cl.train_task(data)
+    #     cl.after_task(tm, data)
+
+    for task in tm:
         print(task)
         cl = ContinualLearner(task, method)
         # cl = ContinualLearner(tm[1], method)
