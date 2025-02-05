@@ -14,7 +14,8 @@ from tqdm import tqdm
 import random
 from Dataloader import Dataloader
 from model import AMiL, AMiLExpandable
-
+# torch.serialization.add_safe_globals([AMiLExpandable])
+# torch.serialization.add_safe_globals([AMiL])
 # create prepare data ,train_loader, ..
 
 
@@ -23,7 +24,7 @@ class ContinualLearner:
         print(task)
         self.task = task
         self.method = method.lower()
-        self.epochs = 1
+        self.epochs = 100
         self.device = torch.device(
             "cuda:0" if torch.cuda.is_available() else "cpu")
         self.ngpu = torch.cuda.device_count()
@@ -47,7 +48,7 @@ class ContinualLearner:
             self.model = torch.load(
                 os.path.join("models",
                              "model-" + self.task.prev_modelname + "-" + self.method + ".pt"),
-                map_location="cpu")
+                map_location=self.device,weights_only=False)
             in_features = self.model.classifier[-1].in_features
             out_features = self.model.classifier[-1].out_features
             # save weights of the previous task
@@ -64,6 +65,7 @@ class ContinualLearner:
                 self.n_known = len(self.task.class_list)
 
         self.model = self.model.to(self.device)
+  
 
     def train_task(self, data):
         print("training task")
@@ -139,9 +141,9 @@ class ContinualLearner:
             dlt = Dataloader(self.task, data, train=False)
             train_loader = torch.utils.data.DataLoader(dl, num_workers=1)
             test_loader = torch.utils.data.DataLoader(dlt, num_workers=1)
-            self.model.update_classifier(
-                mode='aux', num_classes=(len(self.task.class_list) + 1), reset=False)
-
+            self.model.update_classifier(mode='aux', num_classes=(len(self.task.class_list) + 1))
+            self.model = self.model.to(self.device)
+            
         # Step 3: Representation Learning Stage
         # Freeze previous feature extractors (Φ_{t-1})
         params_to_update = []
@@ -156,6 +158,7 @@ class ContinualLearner:
                               momentum=0.9, nesterov=True)
 
         for ep in range(self.epochs):
+            self.model.update_classifier(mode='main')
             self.model.train()
             total_loss, corrects = 0, 0
 
@@ -163,6 +166,9 @@ class ContinualLearner:
                 optimizer.zero_grad()
                 label, bag = label.to(self.device), bag.to(
                     self.device).squeeze()
+                if bag.dim() < 4 or bag.shape[0] < 2:  # Ensure batch size is valid
+                    print(f"Skipping empty bag at index {batch_idx}, shape: {bag.shape}")
+                    continue  
                 if self.task.task_id > 0:
                     # Step 1: Prune and mask the new feature extractor
                     sparsity_loss, new_features_only = self._apply_mask(
@@ -171,14 +177,14 @@ class ContinualLearner:
                     # Step 2: Compute auxiliary loss using pruned features
                     aux_loss = self._compute_aux_loss(new_features_only, label)
                     self.model.update_attention(mode='main')
-                    self.model.update_classifier(mode='main', reset=False)
+                    self.model.update_classifier(mode='main')
                 else:
                     sparsity_loss = 0
                     aux_loss = 0
 
                 # Step 3: Forward pass through the main model for classification
                 prediction = self.model(bag, mode='main')
-
+    
                 # Step 4: Compute classification loss
                 clsloss = nn.CrossEntropyLoss()(prediction, label)
 
@@ -265,14 +271,14 @@ class ContinualLearner:
     def update_memory(self, dl):
         m = self.K // (len(self.exemplar_sets.keys()) +
                        (len(self.task.class_list)))
+        print(m)
         self.reduce_exemplar_sets(m)
-        print("Retraining the classifier with balanced data...")
         for cls in self.task.class_list:
             print("Constructing exemplar set for " +
                   str(cls), end="... ", flush=True)
             imgs = dl.get_images(cls)
             self.exemplar_sets[str(
-                cls)] = self.construct_exemplar_set(imgs, m)
+                cls)] = self.construct_cs_exemplar_set(imgs, m,method='ks')
             print("[done]")
 
         for eskey in self.exemplar_sets:
@@ -360,14 +366,16 @@ class ContinualLearner:
         self.model.eval()  # Freeze feature extractors
         self.model.classifier.train()  # Train only the classifier
 
-        for ep in range(1):  # Fewer epochs for classifier retraining
+        for ep in range(self.epochs//2):  # Fewer epochs for classifier retraining
             total_loss, corrects = 0, 0
 
-            for _, bag, label in balanced_loader:
+            for batch_idx, (_, bag, label) in enumerate(balanced_loader):
                 optimizer.zero_grad()
                 label, bag = label.to(self.device), bag.to(
                     self.device).squeeze()
-
+                if bag.dim() < 4 or bag.shape[0] < 2:  # Ensure batch size is valid
+                    print(f"Skipping empty bag at index {batch_idx}, shape: {bag.shape}")
+                    continue  
                 # Forward pass through frozen feature extractor
                 with torch.no_grad():
                     features = self.model.get_features(bag, mode='main')
@@ -585,6 +593,7 @@ class ContinualLearner:
 
         self.ewc_importance = 3000
         self.epochs = 10
+
         if self.task.task_id == 0:
             return
 
@@ -749,7 +758,7 @@ class ContinualLearner:
                       str(self.task.task_id)+"-"+str(cls), end="... ", flush=True)
                 imgs = dl.get_images(cls)
                 self.exemplar_sets[str(
-                    self.task.task_id)+"-"+str(cls)] = self.construct_exemplar_set(imgs, m)
+                    self.task.task_id)+"-"+str(cls)] = self.construct_herding_exemplar_set(imgs, m)
                 print("[done]")
         else:
             for cls in self.task.class_list:
@@ -757,7 +766,7 @@ class ContinualLearner:
                       str(cls), end="... ", flush=True)
                 imgs = dl.get_images(cls)
                 self.exemplar_sets[str(
-                    cls)] = self.construct_exemplar_set(imgs, m)
+                    cls)] = self.construct_herding_exemplar_set(imgs, m)
                 print("[done]")
 
         for eskey in self.exemplar_sets:
@@ -781,17 +790,7 @@ class ContinualLearner:
                 budget -= len(oldlist[i].squeeze())
                 i += 1
 
-    # def combine_dataset_with_exemplars(self, dataset):
-    #     for eskey in self.exemplar_sets:
-    #         if self.task.experiment == 2:
-    #             eslbl = eskey.split("-")[1]
-    #         else:
-    #             eslbl = eskey
-
-    #         dataset.append(self.exemplar_sets[eskey], eslbl)
-    #     return dataset
-
-    def construct_exemplar_set(self, images, m):
+    def construct_herding_exemplar_set(self, images, m):
         # Compute and cache features for each example
         # load features of cls
         features = []
@@ -1269,7 +1268,7 @@ class ContinualLearner:
                       str(cls), end="... ", flush=True)
                 imgs = dl.get_images(cls)
                 self.exemplar_sets[str(self.task.task_id)+"-"+str(cls)], self.cellsinfo[str(
-                    self.task.task_id)+"-"+str(cls)] = self.construct_ks_exemplerset(imgs, m, method=method)
+                    self.task.task_id)+"-"+str(cls)] = self.construct_cs_exemplar_set(imgs, m, method)
                 print("[done]")
         else:
             for cls in self.task.class_list:
@@ -1277,7 +1276,7 @@ class ContinualLearner:
                       str(cls), end="... ", flush=True)
                 imgs = dl.get_images(cls)
                 self.exemplar_sets[str(cls)], self.cellsinfo[str(
-                    cls)] = self.construct_exemplerset(imgs, m, method)
+                    cls)] = self.construct_cs_exemplar_set(imgs, m, method)
                 print("[done]")
 
         for eskey in self.exemplar_sets:
@@ -1302,7 +1301,7 @@ class ContinualLearner:
                                   [int(j - weights[i - 1])], K[i - 1][j])
                 else:
                     K[i][j] = K[i - 1][j]
-        mmax_value = K[n][capacity]
+        
         max_value = K[n][capacity]
         j = capacity
 
@@ -1314,15 +1313,15 @@ class ContinualLearner:
             else:
                 selected_items.append(i - 1)
                 max_value -= values[i - 1]
-                j -= int(weights[i - 1])
+                j -= int(j - weights[i - 1])
 
         selected_items.reverse()
 
-        return mmax_value, selected_items
+        return max_value, selected_items
 
-    def construct_exemplerset(self, images, m, method):
+    def construct_cs_exemplar_set(self, images, m, method):
         """
-            Constructs an exemplar set using the specified selection method.
+            Constructs an exemplar set using the class specified selection method.
 
             Args:
                 images: List of bags where each bag contains instances.
@@ -1351,7 +1350,7 @@ class ContinualLearner:
         for i, patient in enumerate(images):
             x = Variable(torch.tensor(patient).float()).to(self.device)
             _, att, bagfeat, feats = self.model.get_full_prediction(
-                x.squeeze())
+                x.squeeze(),mode='main')
 
             if len(feats.shape) < 2:
                 feats = feats.unsqueeze(0)
@@ -1387,7 +1386,7 @@ class ContinualLearner:
         #     pickle.dump([features, images, exemplar_set, cellsinfo],f)
 
         # self.counter += 1
-        return exemplar_set, sampled_cellsinfo
+        return exemplar_set
 
     def _select_random(self, images, cellsinfo, m):
         """
@@ -1442,6 +1441,7 @@ class ContinualLearner:
         exemplar_set, sampled_cellsinfo = self.select_exemplar_sets_ks(
             images, m, cellsinfo)
         return exemplar_set, sampled_cellsinfo
+        #return exemplar_set, sampled_cellsinfo
 
     @staticmethod
     def normalize(a):
@@ -1455,6 +1455,9 @@ class ContinualLearner:
             0.2 * self.normalize(cellsinfo[:, 3]) + \
             0.5 * cellsinfo[:, 2]
         weights = np.ones(len(cellscores))
+        print(f"weights: {weights}, values: {cellscores}, capacity: {m}")
+        print(f"len(weights): {len(weights)}, len(values): {len(cellscores)}")
+
         _, selected_items = self.knapsack(weights, cellscores, m)
         # selected_items = np.array(range(m))
         exemplar_set = []
@@ -1463,14 +1466,33 @@ class ContinualLearner:
         for i in np.unique(simgs[:, 0]):
             assert len(images[i].shape) == 4, images[i].shape
 
-            imgs = images[i][simgs[simgs[:, 0] == i, 1]]
-            smpinfo = cellsinfo[simgs[simgs[:, 0] == i, 1]]
+            # imgs = images[i][simgs[simgs[:, 0] == i, 1]]
+            # smpinfo = cellsinfo[simgs[simgs[:, 0] == i, 1]]
+            
+            imgs = torch.tensor(images[i][simgs[simgs[:, 0] == i, 1]], dtype=torch.float32)  
+            smpinfo = torch.tensor(cellsinfo[simgs[simgs[:, 0] == i, 1]], dtype=torch.float32)  
+
             smpinfo[:, 0] = i
-            smpinfo[:, 1] = np.array(range(0, imgs.shape[0]))
+            smpinfo[:, 1] = torch.arange(0, imgs.shape[0], dtype=torch.float32)
+
             exemplar_set.append(imgs)
             remaining_cells_info.append(smpinfo)
 
+        # # Convert lists to tensors
+        # if all([ex.shape == exemplar_set[0].shape for ex in exemplar_set]):
+        #     exemplar_set = torch.stack(exemplar_set)
+        # else:
+        #     exemplar_set = torch.cat(exemplar_set, dim=0)  # Use cat if different sizes
+
+        # if all([info.shape == remaining_cells_info[0].shape for info in remaining_cells_info]):
+        #     remaining_cells_info = torch.stack(remaining_cells_info)
+        # else:
+        #     remaining_cells_info = torch.cat(remaining_cells_info, dim=0)
+
         return exemplar_set, remaining_cells_info
+        #return exemplar_set, remaining_cells_info
+        #return torch.stack(exemplar_set), torch.stack(remaining_cells_info)
+
 
     def reduce_exemplar_sets_ks(self, m):
         for eskey in self.exemplar_sets:

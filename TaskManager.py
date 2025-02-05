@@ -13,7 +13,7 @@ class TaskManager:
         self._split, self.patients = self.load()
 
         if experiment == 1:
-            cls = [[0, 1], [2, 3], [4, 5, 6], [7, 8]]
+            cls = [[0, 1], [2, 3], [4, 5], [6, 7]]
 
             cumm_cls = []
             for i, c in enumerate(cls):
@@ -55,9 +55,9 @@ class TaskManager:
 
     def load(self):
         print("Loading patient lists and labels", end="... ", flush=True)
-        with open("dataset/reduced_data/split-small.dat", "rb") as f:
+        with open("./../ContMIL-main/dataset/split.dat", "rb") as f:
             split = pickle.load(f)
-        with open("dataset/reduced_data/patients-small.dat", "rb") as f:
+        with open("./../ContMIL-main/dataset/patients.dat", "rb") as f:
             patients = pickle.load(f)
         print("[done]")
         return split, patients

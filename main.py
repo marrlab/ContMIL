@@ -6,11 +6,12 @@ from utils.utils import loaddata
 
 if __name__ == '__main__':
     # experiment = int(sys.argv[2])
-    experiment = 1
+    
     # method = sys.argv[1]
+    experiment = 1
     method = 'der'
     tm = TaskManager(experiment=experiment)
-    data = loaddata(True)
+    data = loaddata()
 
     # for i, task in enumerate(tm):
     #     if i == 0:

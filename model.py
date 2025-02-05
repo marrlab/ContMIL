@@ -100,7 +100,8 @@ class AMiL(nn.Module):
 class AMiLExpandable(AMiL):
     def __init__(self):
         super(AMiLExpandable, self).__init__()
-
+        self.device=torch.device("cuda:0")
+        #self.device=torch.device("cpu")
         # Store additional feature extractors in a list
         self.additional_feature_extractors = nn.ModuleList()
 
@@ -110,7 +111,7 @@ class AMiLExpandable(AMiL):
             nn.ReLU(),
             # Includes one extra class for old concepts
             nn.Linear(256, 8)
-        )
+        ).to(self.device)
 
     def add_feature_extractor(self, input_channels, output_channels, hidden_layers):
         """
@@ -168,7 +169,7 @@ class AMiLExpandable(AMiL):
             nn.Linear(combined_feature_size, self.D),
             nn.Tanh(),
             nn.Linear(self.D, 1)
-        )
+        ).to(self.device)
 
     def update_classifier(self, mode, num_classes=None, reset=False):
         """
@@ -194,10 +195,11 @@ class AMiLExpandable(AMiL):
             nn.Linear(combined_feature_size, 256),
             nn.ReLU(),
             nn.Linear(256, num_classes)
-        )
+        ).to(self.device)
+
 
         # Only inherit weights if reset=False (continual learning)
-        if not reset:
+        if not reset and  mode== 'main' :
             with torch.no_grad():
                 old_classifier = self.classifier
                 # Previous feature size
@@ -211,10 +213,15 @@ class AMiLExpandable(AMiL):
                 new_classifier[2].weight = old_classifier[2].weight
                 new_classifier[2].bias = old_classifier[2].bias
 
-        # Assign the new classifier
-        self.classifier = new_classifier
+        if mode== 'aux':
+            # Assign the new classifier
+            self.aux_classifier = new_classifier
+        else:
+            # Assign the new classifier
+            self.classifier = new_classifier
 
     def forward_main(self, x):
+        
         base_features = self.ftr_proc(x)
 
         # Collect features from additional extractors with masks
@@ -226,7 +233,6 @@ class AMiLExpandable(AMiL):
             if i < len(self.additional_feature_extractors) - 1:
                 current_feature_ext = current_feature_ext.detach()
             additional_features.append(current_feature_ext)
-
         # Concatenate all features, no chaining !
         combined_features = torch.cat(
             [base_features] + additional_features, dim=1)
@@ -281,7 +287,7 @@ class AMiLExpandable(AMiL):
             # Collect features from additional extractors with masks
             current_feature_ext = self.additional_feature_extractors[-1]
             combined_features = current_feature_ext(x)
-
+        
         elif mode == 'main':
             base_features = self.ftr_proc(x)
             # Collect features from additional extractors with masks
@@ -300,6 +306,39 @@ class AMiLExpandable(AMiL):
         att_softmax = F.softmax(att_raw, dim=1)
         bag_features = torch.mm(att_softmax, combined_features)
         return bag_features
+    
+    def get_full_prediction(self, x, mode):
+        """Get full prediction with attention and extracted features."""
+
+        if mode == 'aux':
+            self.update_attention(mode='aux')
+            # Collect features from additional extractors with masks
+            current_feature_ext = self.additional_feature_extractors[-1]
+            combined_features = current_feature_ext(x)
+
+        elif mode == 'main':
+            base_features = self.ftr_proc(x)
+            # Collect features from additional extractors with masks
+            additional_features = []
+            for extractor in self.additional_feature_extractors:
+                current_feature_ext = extractor(x)
+                additional_features.append(current_feature_ext)
+
+            # Concatenate all features
+            combined_features = torch.cat(
+                [base_features] + additional_features, dim=1)
+
+        # Apply dynamic attention mechanism
+        att_raw = self.attention(combined_features)
+        att_raw = torch.transpose(att_raw, 1, 0)
+        att_softmax = F.softmax(att_raw, dim=1)
+        bag_features = torch.mm(att_softmax, combined_features)
+
+        # Get final prediction
+        prediction = self.classifier(bag_features)
+
+        return prediction, att_softmax, bag_features, combined_features
+
 
 
 class MaskLayer(nn.Module):
