@@ -3,15 +3,16 @@ from ContinualLearner import ContinualLearner
 from TaskManager import TaskManager
 from utils.utils import loaddata
 
+# bebin data asan bage khali dare ya na, chon random kar nemikone
 
 if __name__ == '__main__':
-    # experiment = int(sys.argv[2])
-    
-    # method = sys.argv[1]
-    experiment = 1
-    method = 'der'
+    experiment = int(sys.argv[2])
+    method = sys.argv[1]
+    # experiment = 1
+    # method = 'lb'
     tm = TaskManager(experiment=experiment)
     data = loaddata()
+
 
     # for i, task in enumerate(tm):
     #     if i == 0:

@@ -62,6 +62,16 @@ class TaskManager:
         print("[done]")
         return split, patients
 
+    #load small data 
+    # def load(self):
+    #     print("Loading patient lists and labels", end="... ", flush=True)
+    #     with open("./../ContMIL-main/dataset/split-small.dat", "rb") as f:
+    #         split = pickle.load(f)
+    #     with open("./../ContMIL-main/dataset/patients-small.dat", "rb") as f:
+    #         patients = pickle.load(f)
+    #     print("[done]")
+    #     return split, patients
+
     def __len__(self):
         return len(self.Tasks)
 

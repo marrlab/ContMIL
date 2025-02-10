@@ -24,7 +24,7 @@ class ContinualLearner:
         print(task)
         self.task = task
         self.method = method.lower()
-        self.epochs = 100
+        self.epochs = 2
         self.device = torch.device(
             "cuda:0" if torch.cuda.is_available() else "cpu")
         self.ngpu = torch.cuda.device_count()
@@ -34,7 +34,7 @@ class ContinualLearner:
 
     def _init_model(self):
         if self.task.task_id == 0:
-            if self.method == "der":
+            if self.method == "der" or self.method=='csder' :
                 self.model = AMiLExpandable()
             else:
                 self.model = AMiL()
@@ -94,6 +94,8 @@ class ContinualLearner:
             self._train_iCaRL(data, bic=True)
         elif self.method == 'der':
             self._train_der(data)
+        elif self.method == 'csder':
+            self._train_der(data,cs=True) 
         else:
             print("Method not found")
             exit()
@@ -120,12 +122,9 @@ class ContinualLearner:
                 0] + ".tmp" if self.task.experiment == 4 \
                 else "tmp/" + str(self.task.experiment) + self.method + ".tmp"
             with open(filename, "rb") as f:
-                if self.method == "csatticarl":
-                    self.exemplar_sets, self.cellsinfo = pickle.load(f)
-                else:
                     self.exemplar_sets = pickle.load(f)
 
-    def _train_der(self, data):
+    def _train_der(self, data,cs=False):
         print("Training task")
         self._init_der()
         dl = Dataloader(self.task, data, train=True)
@@ -166,9 +165,6 @@ class ContinualLearner:
                 optimizer.zero_grad()
                 label, bag = label.to(self.device), bag.to(
                     self.device).squeeze()
-                if bag.dim() < 4 or bag.shape[0] < 2:  # Ensure batch size is valid
-                    print(f"Skipping empty bag at index {batch_idx}, shape: {bag.shape}")
-                    continue  
                 if self.task.task_id > 0:
                     # Step 1: Prune and mask the new feature extractor
                     sparsity_loss, new_features_only = self._apply_mask(
@@ -208,7 +204,7 @@ class ContinualLearner:
             bdl, _ = self.create_balanced_data_loader(dl)
             # Step 4: Classifier Learning Stage (Retrain Classifier with Balanced Data)
             self.retrain_classifier(bdl)
-        self.update_memory(dl)
+        self.update_memory(dl,cs)
         # Step 6: Evaluate and finalize the model
         self._evaluate_model(test_loader)
 
@@ -268,7 +264,7 @@ class ContinualLearner:
         sparsity_loss /= len(self.model.additional_feature_extractors)
         return sparsity_loss, masked_features
 
-    def update_memory(self, dl):
+    def update_memory(self, dl,cs):
         m = self.K // (len(self.exemplar_sets.keys()) +
                        (len(self.task.class_list)))
         print(m)
@@ -277,8 +273,12 @@ class ContinualLearner:
             print("Constructing exemplar set for " +
                   str(cls), end="... ", flush=True)
             imgs = dl.get_images(cls)
-            self.exemplar_sets[str(
-                cls)] = self.construct_cs_exemplar_set(imgs, m,method='ks')
+            if cs: 
+                self.exemplar_sets[str(
+                    cls)], self.cellsinfo[str(cls)] = self.construct_cs_exemplar_set(imgs, m,method='ks')
+            else: 
+                self.exemplar_sets[str(
+                    cls)] = self.construct_herding_exemplar_set(imgs,m)
             print("[done]")
 
         for eskey in self.exemplar_sets:
@@ -290,7 +290,7 @@ class ContinualLearner:
         os.makedirs("tmp", exist_ok=True)
         with open(filename, "wb") as f:
             pickle.dump(self.exemplar_sets, f)
-
+        
     def create_balanced_data_loader(self, dl):
         """
         Creates a balanced data loader using the existing Dataloader class.
@@ -357,7 +357,6 @@ class ContinualLearner:
         num_cls = len(self.task.cumm_cls)
         self.model.update_classifier(
             mode='main', num_classes=num_cls, reset=True)
-        print(self.model.classifier)
         # **Step 2: Prepare optimizer (train only the classifier)**
         optimizer = optim.SGD(
             self.model.classifier.parameters(), lr=0.001, momentum=0.9)
@@ -736,18 +735,16 @@ class ContinualLearner:
                 0] + ".tmp" if self.task.experiment == 4 \
                 else "tmp/" + str(self.task.experiment) + self.method + ".tmp"
             with open(filename, "rb") as f:
-                if self.method == "csatticarl":
+                if self.method == "csatticarl_ks" or self.method == "csatticarl_random":
                     self.exemplar_sets, self.cellsinfo = pickle.load(f)
                 else:
                     self.exemplar_sets = pickle.load(f)
 
-    def _train_iCaRL(self, data, bic=True):
+    def _train_iCaRL(self, data, bic=False):
         self._init_icarl()
 
-        dl = Dataloader(self.task, data, train=True)
-        dlt = Dataloader(self.task, data, train=False)
 
-        self.update_representation(data, dl, dlt, bic)
+        dl= self.update_representation(data, bic)
         m = self.K // (len(self.exemplar_sets.keys()) +
                        (len(self.task.class_list)))
         self.reduce_exemplar_sets(m)
@@ -796,10 +793,16 @@ class ContinualLearner:
         features = []
         for i, patient in enumerate(images):
             x = Variable(torch.tensor(patient).float()).to(self.device)
-            feature = self.model.get_features(
-                x.squeeze(), mode='main').data.cpu().numpy()
+            if self.method == 'der' or self.method == 'csder':
+                feature = self.model.get_features(
+                    x.squeeze(), mode='main').data.cpu().numpy()
+            else: 
+                feature = self.model.get_features(
+                    x.squeeze()).data.cpu().numpy()
             feature = feature / np.linalg.norm(feature)  # Normalize
             features.append(feature[0])
+
+        
         # calculate class mean
         features = np.array(features)
         class_mean = np.mean(features, axis=0)
@@ -830,10 +833,18 @@ class ContinualLearner:
         return exemplar_set
 
     # caching the network's pre-update outputs for distillation loss.
-    def update_representation(self, data, dl, dlt, bic):
+    def update_representation(self,data, bic):
         self.compute_means = True
         # update dl with old data
-        dl = self.combine_dataset_with_exemplars(dl)
+        dl = Dataloader(self.task, data, train=True)
+        dlt = Dataloader(self.task, data, train=False)
+        train_loader = torch.utils.data.DataLoader(dl, num_workers=1)
+        test_loader = torch.utils.data.DataLoader(dlt, num_workers=1)
+
+        self.combine_dataset_with_exemplars(dl)
+        dl = Dataloader(self.task, data, train=True)
+        dlt = Dataloader(self.task, data, train=False)
+
         if bic:
             self.n_known = len(self.task.class_list)
             train_set, val_set = self.create_balanced_val_set(dl)
@@ -867,7 +878,6 @@ class ContinualLearner:
 
             for indices, bag, label in train_loader:
                 optimizer.zero_grad()
-
                 # send to gpu
                 label = label.to(self.device)
                 bag = bag.to(self.device).squeeze()
@@ -921,7 +931,6 @@ class ContinualLearner:
 
         self.model.eval()
         corrects = 0
-        # TODO: ADD NME CLASSIFIER
         for _, bag, label in test_loader:
             label = label.to(self.device)
             bag = bag.squeeze().to(self.device)
@@ -931,6 +940,7 @@ class ContinualLearner:
 
         accuracy = corrects / len(test_loader)
         print('test_acc: {:.3f}'.format(accuracy))
+        return dl 
 
     def _train_bias_correction_layer(self, val_loader):
         """
@@ -1100,7 +1110,6 @@ class ContinualLearner:
         else:
             exemplar_sets = self.exemplar_sets
         # computing exemplar means per class
-        # TODO: move out mean calculation to end of each task?
         if self.compute_means:
             print("Computing mean of exemplars...")
             exemplar_means = []
@@ -1114,7 +1123,11 @@ class ContinualLearner:
                     if len(ex.shape) == 3:
                         ex = ex.unsqueeze(0)
                     # get features
-                    feature = self.model.get_features(ex).data
+                    if self.method =='der' or self.method == 'csder':
+                        feature = self.model.get_features(ex,mode='main').data
+                       
+                    else:
+                        feature = self.model.get_features(ex).data
                     feature = feature.squeeze()
                     feature.data = feature.data / feature.data.norm()  # Normalize
                     features.append(feature)
@@ -1132,7 +1145,11 @@ class ContinualLearner:
         means = means.transpose(1, 2)  # (batch_size, feature_size, n_classes)
 
         # feature = self.feature_extractor(x)  # (batch_size, feature_size)
-        feature = self.model.get_features(x)
+        if self.method =='der' or self.method == 'csder':
+                        feature = self.model.get_features(x,mode='main').data
+                       
+        else:
+            feature = self.model.get_features(x).data
 
         for i in range(feature.size(0)):  # Normalize
             feature.data[i] = feature.data[i] / feature.data[i].norm()
@@ -1158,10 +1175,9 @@ class ContinualLearner:
     def _train_attiCaRL(self, data):
         self._init_icarl()
 
-        dl = Dataloader(self.task, data, train=True)
-        dlt = Dataloader(self.task, data, train=False)
+        
 
-        self.update_representation(dl, dlt)
+        dl= self.update_representation(data,bic=False)
         m = self.K // (len(self.exemplar_sets.keys()) +
                        (len(self.task.class_list)))
         self.reduce_exemplar_sets(m)
@@ -1233,7 +1249,10 @@ class ContinualLearner:
 
     def get_high_att_cells(self, images, percent):
         x = Variable(torch.tensor(images).float().squeeze()).to(self.device)
-        _, att, _, _ = self.model.get_full_prediction(x)
+        if self.method=='der':
+            _, att, _, _ = self.model.get_full_prediction(x,mode='main')
+        else:
+            _, att, _, _ = self.model.get_full_prediction(x)
         att = att.cpu().detach().numpy().squeeze()
         topn = int(np.ceil(len(att) * percent))
         ind = np.argpartition(att, -topn)[-topn:]
@@ -1253,10 +1272,8 @@ class ContinualLearner:
     def _train_csattiCaRL(self, data, method='ks'):
         self._init_icarl()
 
-        dl = Dataloader(self.task, data, train=True)
-        dlt = Dataloader(self.task, data, train=False)
-
-        self.update_representation(dl, dlt)
+        
+        dl= self.update_representation(data,bic=False)
         # nr of instances that get collected per class
         m = self.K // (len(self.exemplar_sets.keys()) +
                        (len(self.task.class_list)))
@@ -1336,8 +1353,12 @@ class ContinualLearner:
         features = []
         for i, patient in enumerate(images):
             x = Variable(torch.tensor(patient).float()).to(self.device)
-            feature = self.model.get_features(
-                x.squeeze(), mode='main').data.cpu().numpy()
+            if self.method == 'der' or self.method == 'csder':
+                feature = self.model.get_features(
+                    x.squeeze(), mode='main').data.cpu().numpy()
+            else: 
+                feature = self.model.get_features(
+                    x.squeeze()).data.cpu().numpy()
             feature = feature / np.linalg.norm(feature)  # Normalize
             features.append(feature[0])
 
@@ -1349,8 +1370,10 @@ class ContinualLearner:
         cellsinfo = torch.tensor([], device=self.device)
         for i, patient in enumerate(images):
             x = Variable(torch.tensor(patient).float()).to(self.device)
-            _, att, bagfeat, feats = self.model.get_full_prediction(
-                x.squeeze(),mode='main')
+            if self.method == 'der' or self.method == 'csder':
+                _, att, bagfeat, feats = self.model.get_full_prediction(x.squeeze(),mode='main')
+            else:
+                _, att, bagfeat, feats = self.model.get_full_prediction(x.squeeze())
 
             if len(feats.shape) < 2:
                 feats = feats.unsqueeze(0)
@@ -1386,7 +1409,7 @@ class ContinualLearner:
         #     pickle.dump([features, images, exemplar_set, cellsinfo],f)
 
         # self.counter += 1
-        return exemplar_set
+        return exemplar_set,sampled_cellsinfo
 
     def _select_random(self, images, cellsinfo, m):
         """
@@ -1404,10 +1427,11 @@ class ContinualLearner:
         # Step 1: Randomly select indices
         num_samples = min(m, len(cellsinfo))
         selected_items = random.sample(range(len(cellsinfo)), num_samples)
-
+        print('len selected items',len(selected_items))
         # Step 2: Process the selected items
         exemplar_set = []
         simgs = np.array(cellsinfo[selected_items][:, :2], dtype=np.uint8)
+        print('len selected simgs',simgs.shape)
         remaining_cells_info = []
         for i in np.unique(simgs[:, 0]):  # Group by bag ID
             assert len(images[i].shape) == 4, images[i].shape
@@ -1415,13 +1439,16 @@ class ContinualLearner:
             # Select images based on cell indices
             imgs = images[i][simgs[simgs[:, 0] == i, 1]]
             # Get corresponding cell info
-            smpinfo = cellsinfo[selected_items][simgs[:, 0] == i]
+            #smpinfo = cellsinfo[selected_items][simgs[:, 0] == i]
+            smpinfo = cellsinfo[simgs[simgs[:, 0] == i, 1]]
             smpinfo[:, 0] = i  # Update bag ID
             # Update cell IDs within the bag
             smpinfo[:, 1] = np.array(range(0, imgs.shape[0]))
-            exemplar_set.append(imgs)
+            exemplar_set.append(imgs)    
+            
             remaining_cells_info.append(smpinfo)
-
+            print('imgs shape: ',imgs.shape)    
+            print('smpinfo shape: ',smpinfo.shape)      
         return exemplar_set, remaining_cells_info
 
     def _select_ks(self, images, cellsinfo, m):
@@ -1445,6 +1472,7 @@ class ContinualLearner:
 
     @staticmethod
     def normalize(a):
+        #return (a - torch.min(a)) / (torch.max(a) - torch.min(a))
         return (a - np.min(a)) / np.ptp(a)
 
     def select_exemplar_sets_ks(self, images, m, cellsinfo):
@@ -1455,44 +1483,25 @@ class ContinualLearner:
             0.2 * self.normalize(cellsinfo[:, 3]) + \
             0.5 * cellsinfo[:, 2]
         weights = np.ones(len(cellscores))
-        print(f"weights: {weights}, values: {cellscores}, capacity: {m}")
-        print(f"len(weights): {len(weights)}, len(values): {len(cellscores)}")
-
         _, selected_items = self.knapsack(weights, cellscores, m)
+        print('len selected items',len(selected_items))
         # selected_items = np.array(range(m))
         exemplar_set = []
         simgs = np.array(cellsinfo[selected_items][:, :2], dtype=np.uint8)
+        print('len selected simgs',simgs.shape)
         remaining_cells_info = []
         for i in np.unique(simgs[:, 0]):
-            assert len(images[i].shape) == 4, images[i].shape
-
-            # imgs = images[i][simgs[simgs[:, 0] == i, 1]]
-            # smpinfo = cellsinfo[simgs[simgs[:, 0] == i, 1]]
-            
-            imgs = torch.tensor(images[i][simgs[simgs[:, 0] == i, 1]], dtype=torch.float32)  
-            smpinfo = torch.tensor(cellsinfo[simgs[simgs[:, 0] == i, 1]], dtype=torch.float32)  
-
+            assert len(images[i].shape) == 4, '!!!!!!!!!!'+images[i].shape
+            imgs = images[i][simgs[simgs[:, 0] == i, 1]]
+            smpinfo = cellsinfo[simgs[simgs[:, 0] == i, 1]]
             smpinfo[:, 0] = i
-            smpinfo[:, 1] = torch.arange(0, imgs.shape[0], dtype=torch.float32)
-
+            smpinfo[:, 1] = np.array(range(0, imgs.shape[0]))
             exemplar_set.append(imgs)
             remaining_cells_info.append(smpinfo)
-
-        # # Convert lists to tensors
-        # if all([ex.shape == exemplar_set[0].shape for ex in exemplar_set]):
-        #     exemplar_set = torch.stack(exemplar_set)
-        # else:
-        #     exemplar_set = torch.cat(exemplar_set, dim=0)  # Use cat if different sizes
-
-        # if all([info.shape == remaining_cells_info[0].shape for info in remaining_cells_info]):
-        #     remaining_cells_info = torch.stack(remaining_cells_info)
-        # else:
-        #     remaining_cells_info = torch.cat(remaining_cells_info, dim=0)
-
+            print('imgs shape: ',imgs.shape)    
+            print('smpinfo shape: ',smpinfo.shape)    
         return exemplar_set, remaining_cells_info
-        #return exemplar_set, remaining_cells_info
-        #return torch.stack(exemplar_set), torch.stack(remaining_cells_info)
-
+       
 
     def reduce_exemplar_sets_ks(self, m):
         for eskey in self.exemplar_sets:
@@ -1754,9 +1763,15 @@ class ContinualLearner:
                 else:
                     prediction = self.classify(bag)
                     preds = torch.cat([preds, prediction])
-            elif self.method == 'der':
-                prediction = self.model(bag, mode='main')
-                preds = torch.cat([preds, torch.argmax(prediction, dim=1)])
+            elif self.method == 'der' or self.method== 'csder':
+                # prediction = self.model(bag, mode='main')
+                # preds = torch.cat([preds, torch.argmax(prediction, dim=1)])
+                if task.task_id == self.task.task_id:
+                    prediction =  self.model(bag, mode='main')
+                    preds = torch.cat([preds, torch.argmax(prediction, dim=1)])
+                else:
+                    prediction = self.classify(bag)
+                    preds = torch.cat([preds, prediction])
             else:
                 prediction = self.model(bag)
                 preds = torch.cat([preds, torch.argmax(prediction, dim=1)])
